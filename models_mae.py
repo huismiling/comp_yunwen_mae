@@ -219,6 +219,14 @@ class MaskedAutoencoderViT(nn.Module):
         loss = self.forward_loss(imgs, pred, mask)
         return loss, pred, mask
 
+def mae_vit_base_patch16_dec384d4b(**kwargs):
+    model = MaskedAutoencoderViT(
+        patch_size=16, embed_dim=512, depth=8, num_heads=8,
+        decoder_embed_dim=384, decoder_depth=4, decoder_num_heads=6,
+        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+
 
 def mae_vit_base_patch16_dec512d8b(**kwargs):
     model = MaskedAutoencoderViT(
@@ -245,6 +253,7 @@ def mae_vit_huge_patch14_dec512d8b(**kwargs):
 
 
 # set recommended archs
+mae_vit_tiny_patch16 = mae_vit_base_patch16_dec384d4b  # decoder: 512 dim, 4 blocks
 mae_vit_base_patch16 = mae_vit_base_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
 mae_vit_large_patch16 = mae_vit_large_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
 mae_vit_huge_patch14 = mae_vit_huge_patch14_dec512d8b  # decoder: 512 dim, 8 blocks

@@ -12,7 +12,6 @@
 import argparse
 import datetime
 import json
-import random
 import numpy as np
 import os
 import time
@@ -46,7 +45,7 @@ from engine_finetune import train_one_epoch, evaluate
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE fine-tuning for image classification', add_help=False)
-    parser.add_argument('--batch_size', default=64, type=int,
+    parser.add_argument('--batch_size', default=512, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=50, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
@@ -86,7 +85,7 @@ def get_args_parser():
                         help='Color jitter factor (enabled only when not using Auto/RandAug)')
     parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1', metavar='NAME',
                         help='Use AutoAugment policy. "v0" or "original". " + "(default: rand-m9-mstd0.5-inc1)'),
-    parser.add_argument('--smoothing', type=float, default=0.05,
+    parser.add_argument('--smoothing', type=float, default=0.1,
                         help='Label smoothing (default: 0.1)')
 
     # * Random Erase params
@@ -149,9 +148,6 @@ def get_args_parser():
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
     parser.set_defaults(pin_mem=True)
 
-    parser.add_argument('--use_pseudo', action='store_true', default=False,
-                        help='use pseudo label')
-
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
@@ -175,65 +171,45 @@ def main(args):
     seed = args.seed + misc.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
-    random.seed(seed)
 
-    cudnn.enabled = True
-    cudnn.deterministic = True
-    cudnn.benchmark = False
+    cudnn.benchmark = True
 
     # dataset_train = build_dataset(is_train=True, args=args)
     # dataset_val = build_dataset(is_train=False, args=args)
-    transform_train = transforms.Compose([
+    transform_test = transforms.Compose([
         # transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
         # transforms.RandomHorizontalFlip(),
-        # transforms.ToTensor(),
-        transforms.Resize((args.input_size, args.input_size)),
+        transforms.Resize((args.input_size,args.input_size)),  # 3 is bicubic
+        transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    use_pseudo = args.use_pseudo
-    dataset_train = CustomDataset("updated_train_images.txt" if use_pseudo else "dummy.txt", transform=transform_train)
-    
-    global_rank = misc.get_rank()
-    if False:  # args.distributed:
-        num_tasks = misc.get_world_size()
-        global_rank = misc.get_rank()
-        sampler_train = torch.utils.data.DistributedSampler(
-            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-        )
-        print("Sampler_train = %s" % str(sampler_train))
-        # if args.dist_eval:
-        #     if len(dataset_val) % num_tasks != 0:
-        #         print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
-        #               'This will slightly alter validation results as extra duplicate entries are added to achieve '
-        #               'equal num of samples per-process.')
-        #     sampler_val = torch.utils.data.DistributedSampler(
-        #         dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=True)  # shuffle=True to reduce monitor bias
-        # else:
-        #     sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-        # sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-    if global_rank == 0 and args.log_dir is not None and not args.eval:
+    # dataset_train = CustomDataset(os.path.join(args.data_path, 'train'), transform=transform_train)
+    dataset_test = CustomDataset("all_train_images.txt", transform=transform_test, finetune=False)
+
+    # sampler_train = torch.utils.data.RandomSampler(dataset_train)
+    sampler_val = torch.utils.data.SequentialSampler(dataset_test)
+
+    if args.log_dir is not None and not args.eval:
         os.makedirs(args.log_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.log_dir)
     else:
         log_writer = None
 
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=True,
-    )
-
-    # data_loader_val = torch.utils.data.DataLoader(
-    #     dataset_val, sampler=sampler_val,
+    # data_loader_train = torch.utils.data.DataLoader(
+    #     dataset_train, sampler=sampler_train,
     #     batch_size=args.batch_size,
     #     num_workers=args.num_workers,
     #     pin_memory=args.pin_mem,
-    #     drop_last=False
+    #     drop_last=True,
     # )
+
+    data_loader_val = torch.utils.data.DataLoader(
+        dataset_test, sampler=sampler_val,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=False
+    )
 
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
@@ -249,32 +225,6 @@ def main(args):
         drop_path_rate=args.drop_path,
         global_pool=args.global_pool,
     )
-
-    if args.finetune and not args.eval:
-        checkpoint = torch.load(args.finetune, map_location='cpu')
-
-        print("Load pre-trained checkpoint from: %s" % args.finetune)
-        checkpoint_model = checkpoint['model']
-        state_dict = model.state_dict()
-        for k in ['head.weight', 'head.bias']:
-            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                print(f"Removing key {k} from pretrained checkpoint")
-                del checkpoint_model[k]
-
-        # interpolate position embedding
-        interpolate_pos_embed(model, checkpoint_model)
-
-        # load pre-trained model
-        msg = model.load_state_dict(checkpoint_model, strict=False)
-        print(msg)
-
-        # if args.global_pool:
-        #     assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
-        # else:
-        #     assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
-
-        # manually initialize fc layer
-        trunc_normal_(model.head.weight, std=2e-5)
 
     model.to(device)
 
@@ -294,10 +244,6 @@ def main(args):
 
     print("accumulate grad iterations: %d" % args.accum_iter)
     print("effective batch size: %d" % eff_batch_size)
-
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        model_without_ddp = model.module
 
     # build optimizer with layer-wise lr decay (lrd)
     param_groups = lrd.param_groups_lrd(model_without_ddp, args.weight_decay,
@@ -319,67 +265,28 @@ def main(args):
 
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
-    # if args.eval:
-    #     test_stats = evaluate(data_loader_val, model, device)
-    #     print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-    #     exit(0)
-
-    print(f"Start training for {args.epochs} epochs")
-    start_time = time.time()
-    max_accuracy = 0.0
-    god_imgs = []
-    for i in range(5):
-        path = "godden/yunwen{}.png".format(i)
-        with open(path, "rb") as f:
-            img = Image.open(f)
-            sample = img.convert("RGB")
-            god_imgs.append(sample)
-            # god_imgs.append(transform_train(sample).unsqueeze(0))
-    # god_imgs = torch.cat(imgs)
-    # print("god_imgs size ", god_imgs.size())
-
-
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
-        train_stats = train_one_epoch(
-            model, criterion, data_loader_train,
-            optimizer, device, epoch, loss_scaler,
-            args.clip_grad, mixup_fn, god_imgs,
-            log_writer=log_writer,
-            args=args
-        )
-        if args.output_dir:
-            tag = "pseudo" if use_pseudo else "pretrain"
-            misc.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch, tag=f"finetune-{tag}-")
-
-        # test_stats = evaluate(data_loader_val, model, device)
-        # print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        # max_accuracy = max(max_accuracy, test_stats["acc1"])
-        # print(f'Max accuracy: {max_accuracy:.2f}%')
-
-        # if log_writer is not None:
-        #     log_writer.add_scalar('perf/test_acc1', test_stats['acc1'], epoch)
-        #     log_writer.add_scalar('perf/test_acc5', test_stats['acc5'], epoch)
-        #     log_writer.add_scalar('perf/test_loss', test_stats['loss'], epoch)
-
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                        # **{f'test_{k}': v for k, v in test_stats.items()},
-                        'epoch': epoch,
-                        'n_parameters': n_parameters}
-
-        if args.output_dir and misc.is_main_process():
-            if log_writer is not None:
-                log_writer.flush()
-            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-                f.write(json.dumps(log_stats) + "\n")
-
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
-
+    model.eval()
+    with torch.no_grad():
+        imgs = []
+        for i in range(5):
+            path = "godden/yunwen{}.png".format(i)
+            with open(path, "rb") as f:
+                img = Image.open(f)
+                sample = img.convert("RGB")
+                sample = transform_test(sample)
+                print(sample.size())
+                imgs.append(sample.unsqueeze(0))
+        god_imgs = torch.cat(imgs)
+        print("god_imgs size ", god_imgs.size())
+        preds = model(god_imgs.cuda())
+        print(preds[0])
+        fres = open("all_train_results.txt", "w+")
+        output, values, _ = evaluate(data_loader_val, model, device, god_imgs=god_imgs)
+        # print(output.size())
+        # results = output.cpu().numpy()[5:].reshape(-1).tolist()
+        output = ["{},{}".format(i,j) for i,j in zip(output, values)]
+        fres.writelines("\n".join(map(str, output)))
+        fres.write("\n")
 
 if __name__ == '__main__':
     args = get_args_parser()
